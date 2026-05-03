@@ -477,7 +477,7 @@ impl VhostUserHandle {
     }
 
     pub fn has_saved_vring_bases(&self) -> bool {
-        self.saved_vring_bases.is_some()
+        matches!(self.saved_vring_bases.as_ref(), Some(bases) if !bases.is_empty())
     }
 
     /// Save backend device state via the SET_DEVICE_STATE_FD protocol.
@@ -496,8 +496,13 @@ impl VhostUserHandle {
         // The backend considers the vrings stopped after GET_VRING_BASE.
         self.ready = false;
 
-        // Stash a copy so resume can rebuild the rings without going through LOAD.
-        self.saved_vring_bases = Some(vring_bases.clone());
+        // Stash a copy so resume can rebuild active rings without going through LOAD.
+        // Pre-activation snapshots have no rings to restart.
+        self.saved_vring_bases = if vring_bases.is_empty() {
+            None
+        } else {
+            Some(vring_bases.clone())
+        };
 
         let (local, remote) = UnixStream::pair().map_err(Error::SaveRestoreBackendState)?;
 
@@ -576,18 +581,19 @@ impl VhostUserHandle {
     pub fn restart_vrings(&mut self, virtio_interrupt: &dyn VirtioInterrupt) -> Result<()> {
         let bases = self
             .saved_vring_bases
-            .take()
+            .as_ref()
+            .filter(|bases| !bases.is_empty())
             .ok_or(Error::MissingSavedVringBases)?;
         let vrings_info = self
             .vrings_info
             .as_ref()
             .ok_or(Error::MissingVringsInfo)?
             .clone();
-        let kick_evts = std::mem::take(&mut self.kick_evts);
+        let bases = bases.clone();
         let queue_indexes = self.queue_indexes.clone();
 
         if vrings_info.len() != bases.len()
-            || vrings_info.len() != kick_evts.len()
+            || vrings_info.len() != self.kick_evts.len()
             || vrings_info.len() != queue_indexes.len()
         {
             return Err(Error::VringBasesCountMismatch(
@@ -621,13 +627,13 @@ impl VhostUserHandle {
             }
 
             self.vu
-                .set_vring_kick(*queue_index, &kick_evts[i])
+                .set_vring_kick(*queue_index, &self.kick_evts[i])
                 .map_err(Error::VhostUserSetVringKick)?;
         }
 
         self.enable_vhost_user_vrings(queue_indexes, true)?;
 
-        self.kick_evts = kick_evts;
+        self.saved_vring_bases = None;
         self.ready = true;
 
         Ok(())

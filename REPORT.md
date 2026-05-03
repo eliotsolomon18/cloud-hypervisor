@@ -48,14 +48,17 @@ captured at the points where they are naturally produced:
   `VhostUserCommon` one level up) means HUP-reconnect — which re-runs
   `setup_vhost_user` via `reinitialize_vhost_user` — automatically refreshes
   them in lockstep with the existing `vrings_info` and `queue_indexes`.
-- `saved_vring_bases: Option<Vec<u64>>` — the per-queue indices captured by
-  `save_backend_state`. Doubles as the discriminator at resume time:
-  `Some(...)` ⇒ snapshot-was-taken (call new `restart_vrings`);
-  `None` ⇒ plain pause (call existing `resume_vhost_user`).
+- `saved_vring_bases: Option<Vec<u64>>` — the non-empty per-queue indices
+  captured by `save_backend_state`. Doubles as the discriminator at resume
+  time: non-empty `Some(...)` ⇒ active vrings were stopped by snapshot (call
+  new `restart_vrings`); `None` ⇒ plain pause or a pre-activation snapshot
+  with no vrings to restart (call existing `resume_vhost_user`).
 
 A new `restart_vrings(&mut self, virtio_interrupt: &dyn VirtioInterrupt)`
-method on `VhostUserHandle` consumes the saved bases and replays the wire
-sequence using `self.kick_evts`, `self.vrings_info`, and `self.queue_indexes`.
+method on `VhostUserHandle` replays the wire sequence using the saved bases,
+`self.kick_evts`, `self.vrings_info`, and `self.queue_indexes`. It leaves the
+retained restart state untouched on error so resume can be retried, and clears
+the saved bases only after the restart succeeds.
 The four-call per-queue body is duplicated once with `setup_vhost_user`'s
 inlined version (~8 LoC) — the alternative (extracting a shared helper)
 increases the activate hot path edit surface without proportional benefit.
@@ -68,9 +71,12 @@ without plumbing changes.
 
 - `setup_vhost_user`: clears (`= None`) at the end, alongside replacing
   `kick_evts`.
-- `save_backend_state`: writes (`= Some(bases)`) immediately after computing
-  the bases via `GET_VRING_BASE`.
-- `restart_vrings`: consumes via `.take()`; sets `ready = true` on success.
+- `save_backend_state`: writes (`= Some(bases)`) only when `GET_VRING_BASE`
+  captured at least one active queue; leaves it `None` for pre-activation
+  snapshots with no vrings to restart.
+- `restart_vrings`: clones/borrows retained restart state while replaying the
+  setup sequence; clears `saved_vring_bases` and sets `ready = true` only after
+  success.
 - `pause_vhost_user` / `resume_vhost_user`: untouched (plain pause/resume path
   is unaffected).
 
@@ -206,18 +212,20 @@ exactly what the new `restart_vrings` does.
   - At the end of the function, alongside the existing
     `self.vrings_info = Some(vrings_info); self.ready = true;` writes:
     `self.kick_evts = kick_clones; self.saved_vring_bases = None;`.
-- `save_backend_state`: stashes `self.saved_vring_bases = Some(vring_bases.clone());`
-  immediately after computing the bases.
+- `save_backend_state`: stashes `self.saved_vring_bases = Some(vring_bases.clone())`
+  only when at least one vring base was captured; pre-activation snapshots keep
+  it as `None` so in-place resume does not require an `interrupt_cb`.
 - Added accessor `pub fn has_saved_vring_bases(&self) -> bool` next to
-  `supports_device_state`.
+  `supports_device_state`; it returns true only for non-empty saved bases.
 - Added new method `pub fn restart_vrings(&mut self, virtio_interrupt: &dyn VirtioInterrupt)`
-  after `restore_backend_state`. Body: takes `saved_vring_bases`, clones
-  `vrings_info`, takes `kick_evts`, clones `queue_indexes`; length-validates
+  after `restore_backend_state`. Body: clones `saved_vring_bases`, clones
+  `vrings_info`, borrows `kick_evts`, clones `queue_indexes`; length-validates
   all four; issues `SET_VRING_NUM` for every queue first, then per-queue
   `SET_VRING_ADDR` / `SET_VRING_BASE` / `SET_VRING_CALL` (gated on
   `virtio_interrupt.notifier(...)`) / `SET_VRING_KICK`; calls existing
-  `enable_vhost_user_vrings(true)`; restores `kick_evts` and sets
-  `ready = true`.
+  `enable_vhost_user_vrings(true)`; clears `saved_vring_bases` and sets
+  `ready = true` only after success. If any step fails, the retained bases and
+  kick FDs remain available for a retry.
 
 ### `virtio-devices/src/vhost_user/mod.rs`
 
@@ -225,8 +233,9 @@ exactly what the new `restart_vrings` does.
   `MissingSavedVringBases`, `MissingVringsInfo`,
   `CloneKickEventFd(#[source] io::Error)`.
 - `VhostUserCommon::resume` now branches on `vu_locked.has_saved_vring_bases()`:
-  on `true`, calls `restart_vrings` with `interrupt_cb.as_ref()` borrowed (not
-  cloned) from `VirtioCommon::interrupt_cb`; otherwise keeps the existing
+  on `true` (non-empty saved bases), calls `restart_vrings` with
+  `interrupt_cb.as_ref()` borrowed (not cloned) from
+  `VirtioCommon::interrupt_cb`; otherwise keeps the existing
   `resume_vhost_user` call. The trailing per-queue `trigger_interrupt` loop is
   unchanged.
 
@@ -266,6 +275,14 @@ exactly what the new `restart_vrings` does.
 - **Plain pause/resume (no snapshot):** unchanged. `pause_vhost_user` only
   sends `SET_VRING_ENABLE(0)`, `saved_vring_bases` stays `None`, and the
   existing `resume_vhost_user` branch runs.
+- **Pre-activation pause/snapshot/resume:** unchanged. `save_backend_state`
+  still returns `vring_bases = Some(vec![])` in the snapshot state for
+  consistency with `backend_state`, but the live handle keeps
+  `saved_vring_bases = None`, so resume does not require an `interrupt_cb`.
+- **Resume retry after backend restart error:** improved. `restart_vrings`
+  leaves `saved_vring_bases` and `kick_evts` intact on error, so a later
+  `resume` attempt can retry the full ring-arming sequence instead of falling
+  through to the `ready=false` no-op path.
 - **Source-side resume after a *failed* live migration:** today silently
   broken (the same `ready=false` no-op); with this fix, works correctly per
   spec. Net positive.
@@ -280,10 +297,12 @@ exactly what the new `restart_vrings` does.
 
 ## Verification
 
+- `cargo fmt --check`: clean (stable rustfmt emits warnings about ignored
+  nightly-only import options).
+- `git diff --check`: clean.
 - `cargo check -p virtio-devices`: clean.
-- `cargo check` (workspace): clean.
-- `RUSTFLAGS="--cfg devcli_testenv" cargo check --tests -p cloud-hypervisor`:
-  clean (the integration test binary compiles).
+- `cargo test -p virtio-devices vhost_user`: clean; the filter matches no
+  unit tests, but the test binary compiles.
 - The new integration test was **not** executed locally — it requires the
   `~/workloads/` test environment (Ubuntu Jammy image, virtiofsd, etc.) and
   is run via `./scripts/dev_cli.sh tests --integration --test-filter test_pause_snapshot_resume_virtio_fs`.
