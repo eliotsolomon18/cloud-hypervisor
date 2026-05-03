@@ -497,7 +497,10 @@ impl VhostUserHandle {
         self.ready = false;
 
         // Stash a copy so resume can rebuild active rings without going through LOAD.
-        // Pre-activation snapshots have no rings to restart.
+        // Pre-activation snapshots have no rings to restart. Stashed before the
+        // SET_DEVICE_STATE_FD round-trip below: GET_VRING_BASE has already stopped the
+        // rings on the backend, so even if SAVE fails the caller's only correct recovery
+        // is to restart them on resume.
         self.saved_vring_bases = if vring_bases.is_empty() {
             None
         } else {
