@@ -159,6 +159,12 @@ pub enum Error {
     VringBasesCountMismatch(usize, usize),
     #[error("Backend state and vring bases must both be present or both be absent")]
     InconsistentBackendState,
+    #[error("Missing saved vring bases for vring restart")]
+    MissingSavedVringBases,
+    #[error("Missing vrings_info; setup_vhost_user did not complete")]
+    MissingVringsInfo,
+    #[error("Cloning kick eventfd failed")]
+    CloneKickEventFd(#[source] io::Error),
 }
 type Result<T> = std::result::Result<T, Error>;
 
@@ -518,9 +524,23 @@ impl VhostUserCommon {
 
     pub fn resume(&mut self) -> std::result::Result<(), MigratableError> {
         if let Some(vu) = &self.vu {
-            vu.lock().unwrap().resume_vhost_user().map_err(|e| {
-                MigratableError::Resume(anyhow!("Error resuming vhost-user backend: {e:?}"))
-            })?;
+            let mut vu_locked = vu.lock().unwrap();
+            if vu_locked.has_saved_vring_bases() {
+                let interrupt_cb = self.virtio_common.interrupt_cb.as_ref().ok_or_else(|| {
+                    MigratableError::Resume(anyhow!(
+                        "Missing interrupt_cb when restarting vrings after snapshot"
+                    ))
+                })?;
+                vu_locked.restart_vrings(interrupt_cb.as_ref()).map_err(|e| {
+                    MigratableError::Resume(anyhow!(
+                        "Error restarting vhost-user vrings: {e:?}"
+                    ))
+                })?;
+            } else {
+                vu_locked.resume_vhost_user().map_err(|e| {
+                    MigratableError::Resume(anyhow!("Error resuming vhost-user backend: {e:?}"))
+                })?;
+            }
         }
         for i in 0..self.vu_num_queues {
             self.virtio_common

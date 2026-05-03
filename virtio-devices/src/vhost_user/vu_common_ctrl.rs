@@ -51,7 +51,6 @@ struct VringInfo {
     used_guest_addr: u64,
 }
 
-#[derive(Clone)]
 pub struct VhostUserHandle {
     vu: Frontend,
     ready: bool,
@@ -61,6 +60,8 @@ pub struct VhostUserHandle {
     acked_features: u64,
     vrings_info: Option<Vec<VringInfo>>,
     queue_indexes: Vec<usize>,
+    kick_evts: Vec<EventFd>,
+    saved_vring_bases: Option<Vec<u64>>,
 }
 
 impl VhostUserHandle {
@@ -217,6 +218,8 @@ impl VhostUserHandle {
         }
 
         let mut vrings_info = Vec::new();
+        let mut kick_clones: Vec<EventFd> = Vec::new();
+        self.queue_indexes.clear();
         for (i, (queue_index, queue, queue_evt)) in queues.iter().enumerate() {
             let actual_size: usize = queue.size().into();
 
@@ -281,6 +284,7 @@ impl VhostUserHandle {
                 .set_vring_kick(*queue_index, queue_evt)
                 .map_err(Error::VhostUserSetVringKick)?;
 
+            kick_clones.push(queue_evt.try_clone().map_err(Error::CloneKickEventFd)?);
             self.queue_indexes.push(*queue_index);
         }
 
@@ -293,6 +297,8 @@ impl VhostUserHandle {
         }
 
         self.vrings_info = Some(vrings_info);
+        self.kick_evts = kick_clones;
+        self.saved_vring_bases = None;
         self.ready = true;
 
         Ok(())
@@ -400,6 +406,8 @@ impl VhostUserHandle {
                 acked_features: 0,
                 vrings_info: None,
                 queue_indexes: Vec::new(),
+                kick_evts: Vec::new(),
+                saved_vring_bases: None,
             })
         } else {
             let now = Instant::now();
@@ -417,6 +425,8 @@ impl VhostUserHandle {
                             acked_features: 0,
                             vrings_info: None,
                             queue_indexes: Vec::new(),
+                            kick_evts: Vec::new(),
+                            saved_vring_bases: None,
                         });
                     }
                     Err(e) => e,
@@ -466,6 +476,10 @@ impl VhostUserHandle {
         self.supports_device_state
     }
 
+    pub fn has_saved_vring_bases(&self) -> bool {
+        self.saved_vring_bases.is_some()
+    }
+
     /// Save backend device state via the SET_DEVICE_STATE_FD protocol.
     /// Returns the opaque state blob and per-queue vring base indices.
     pub fn save_backend_state(&mut self) -> Result<(Vec<u8>, Vec<u64>)> {
@@ -481,6 +495,9 @@ impl VhostUserHandle {
 
         // The backend considers the vrings stopped after GET_VRING_BASE.
         self.ready = false;
+
+        // Stash a copy so resume can rebuild the rings without going through LOAD.
+        self.saved_vring_bases = Some(vring_bases.clone());
 
         let (local, remote) = UnixStream::pair().map_err(Error::SaveRestoreBackendState)?;
 
@@ -549,6 +566,69 @@ impl VhostUserHandle {
         self.vu
             .check_device_state()
             .map_err(Error::VhostUserCheckDeviceState)?;
+
+        Ok(())
+    }
+
+    /// Replay the per-queue tail of `setup_vhost_user` to restart vrings the backend
+    /// stopped on `GET_VRING_BASE`. Used after `save_backend_state` when the device is
+    /// resumed in place (no LOAD round-trip needed; the backend retains state across SAVE).
+    pub fn restart_vrings(&mut self, virtio_interrupt: &dyn VirtioInterrupt) -> Result<()> {
+        let bases = self
+            .saved_vring_bases
+            .take()
+            .ok_or(Error::MissingSavedVringBases)?;
+        let vrings_info = self
+            .vrings_info
+            .as_ref()
+            .ok_or(Error::MissingVringsInfo)?
+            .clone();
+        let kick_evts = std::mem::take(&mut self.kick_evts);
+        let queue_indexes = self.queue_indexes.clone();
+
+        if vrings_info.len() != bases.len()
+            || vrings_info.len() != kick_evts.len()
+            || vrings_info.len() != queue_indexes.len()
+        {
+            return Err(Error::VringBasesCountMismatch(
+                bases.len(),
+                queue_indexes.len(),
+            ));
+        }
+
+        // Send SET_VRING_NUM for every queue first (matches setup_vhost_user's early-num
+        // pattern; some backends require this before per-queue addr/base/kick/call).
+        for (i, queue_index) in queue_indexes.iter().enumerate() {
+            self.vu
+                .set_vring_num(*queue_index, vrings_info[i].config_data.queue_size)
+                .map_err(Error::VhostUserSetVringNum)?;
+        }
+
+        for (i, queue_index) in queue_indexes.iter().enumerate() {
+            self.vu
+                .set_vring_addr(*queue_index, &vrings_info[i].config_data)
+                .map_err(Error::VhostUserSetVringAddr)?;
+            self.vu
+                .set_vring_base(*queue_index, bases[i] as u16)
+                .map_err(Error::VhostUserSetVringBase)?;
+
+            if let Some(eventfd) =
+                virtio_interrupt.notifier(VirtioInterruptType::Queue(*queue_index as u16))
+            {
+                self.vu
+                    .set_vring_call(*queue_index, &eventfd)
+                    .map_err(Error::VhostUserSetVringCall)?;
+            }
+
+            self.vu
+                .set_vring_kick(*queue_index, &kick_evts[i])
+                .map_err(Error::VhostUserSetVringKick)?;
+        }
+
+        self.enable_vhost_user_vrings(queue_indexes, true)?;
+
+        self.kick_evts = kick_evts;
+        self.ready = true;
 
         Ok(())
     }

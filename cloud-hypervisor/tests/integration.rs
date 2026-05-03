@@ -8852,6 +8852,130 @@ mod common_sequential {
         let _ = std::fs::remove_file(shared_dir.join("post_restore_file"));
     }
 
+    #[test]
+    #[cfg(not(feature = "mshv"))]
+    fn test_pause_snapshot_resume_virtio_fs() {
+        let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(disk_config));
+        let kernel_path = direct_kernel_boot_path();
+
+        let api_socket = temp_api_path(&guest.tmp_dir);
+
+        let mut workload_path = dirs::home_dir().unwrap();
+        workload_path.push("workloads");
+        let mut shared_dir = workload_path;
+        shared_dir.push("shared_dir");
+
+        let (mut daemon_child, virtiofsd_socket_path) =
+            prepare_virtiofsd(&guest.tmp_dir, shared_dir.to_str().unwrap());
+
+        let event_path = temp_event_monitor_path(&guest.tmp_dir);
+
+        let mut child = GuestCommand::new(&guest)
+            .args(["--api-socket", &api_socket])
+            .args(["--event-monitor", format!("path={event_path}").as_str()])
+            .args(["--cpus", "boot=2"])
+            .args(["--memory", "size=512M,shared=on"])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .default_disks()
+            .default_net()
+            .args([
+                "--fs",
+                format!("socket={virtiofsd_socket_path},tag=myfs,num_queues=1,queue_size=1024")
+                    .as_str(),
+            ])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let snapshot_dir = temp_snapshot_dir_path(&guest.tmp_dir);
+
+        let r = std::panic::catch_unwind(|| {
+            guest.wait_vm_boot().unwrap();
+
+            // Mount virtiofs and confirm baseline I/O.
+            guest
+                .ssh_command("mkdir -p mount_dir && sudo mount -t virtiofs myfs mount_dir/")
+                .unwrap();
+            assert_eq!(
+                guest.ssh_command("cat mount_dir/file1").unwrap().trim(),
+                "foo"
+            );
+
+            // Write a marker file before the snapshot.
+            guest
+                .ssh_command(
+                    "sudo bash -c 'echo pre_snapshot_data > mount_dir/pre_snapshot_file'",
+                )
+                .unwrap();
+
+            // Pause + snapshot on the same VMM (no kill, no fresh VMM after).
+            snapshot_restore_common::snapshot_and_check_events(
+                &api_socket,
+                &snapshot_dir,
+                &event_path,
+            );
+
+            // Resume in place.
+            assert!(remote_command(&api_socket, "resume", None));
+
+            let resumed_events = [
+                &MetaEvent {
+                    event: "resuming".to_string(),
+                    device_id: None,
+                },
+                &MetaEvent {
+                    event: "resumed".to_string(),
+                    device_id: None,
+                },
+            ];
+            assert!(wait_until(Duration::from_secs(30), || {
+                check_latest_events_exact(&resumed_events, &event_path)
+            }));
+
+            // Read the marker file written before the snapshot. Without the fix the
+            // virtio-fs request would hang in the guest forever; `timeout 10` makes
+            // that surface as a non-zero exit and a clean test failure here.
+            assert_eq!(
+                guest
+                    .ssh_command("timeout 10 cat mount_dir/pre_snapshot_file")
+                    .unwrap()
+                    .trim(),
+                "pre_snapshot_data"
+            );
+
+            // Re-read the pre-existing shared file to exercise a second I/O after resume.
+            assert_eq!(
+                guest
+                    .ssh_command("timeout 10 cat mount_dir/file1")
+                    .unwrap()
+                    .trim(),
+                "foo"
+            );
+
+            // Write a new file after the resume; verify it appears on the host.
+            guest
+                .ssh_command(
+                    "timeout 10 sudo bash -c 'echo post_resume_data > mount_dir/post_resume_file'",
+                )
+                .unwrap();
+            let post_resume_content =
+                std::fs::read_to_string(shared_dir.join("post_resume_file")).unwrap();
+            assert_eq!(post_resume_content.trim(), "post_resume_data");
+        });
+
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+        handle_child_output(r, &output);
+
+        let _ = daemon_child.kill();
+        let _ = daemon_child.wait();
+        let _ = remove_dir_all(snapshot_dir.as_str());
+        let _ = std::fs::remove_file(shared_dir.join("pre_snapshot_file"));
+        let _ = std::fs::remove_file(shared_dir.join("post_resume_file"));
+    }
+
     #[cfg(not(feature = "mshv"))]
     fn _test_live_migration_balloon(upgrade_test: bool, local: bool) {
         let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
