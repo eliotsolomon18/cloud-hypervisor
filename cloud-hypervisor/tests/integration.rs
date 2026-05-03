@@ -8905,9 +8905,7 @@ mod common_sequential {
 
             // Write a marker file before the snapshot.
             guest
-                .ssh_command(
-                    "sudo bash -c 'echo pre_snapshot_data > mount_dir/pre_snapshot_file'",
-                )
+                .ssh_command("sudo bash -c 'echo pre_snapshot_data > mount_dir/pre_snapshot_file'")
                 .unwrap();
 
             // Pause + snapshot on the same VMM (no kill, no fresh VMM after).

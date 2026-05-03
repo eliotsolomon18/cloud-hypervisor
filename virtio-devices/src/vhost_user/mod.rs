@@ -531,11 +531,13 @@ impl VhostUserCommon {
                         "Missing interrupt_cb when restarting vrings after snapshot"
                     ))
                 })?;
-                vu_locked.restart_vrings(interrupt_cb.as_ref()).map_err(|e| {
-                    MigratableError::Resume(anyhow!(
-                        "Error restarting vhost-user vrings: {e:?}"
-                    ))
-                })?;
+                vu_locked
+                    .restart_vrings(interrupt_cb.as_ref())
+                    .map_err(|e| {
+                        MigratableError::Resume(anyhow!(
+                            "Error restarting vhost-user vrings: {e:?}"
+                        ))
+                    })?;
             } else {
                 vu_locked.resume_vhost_user().map_err(|e| {
                     MigratableError::Resume(anyhow!("Error resuming vhost-user backend: {e:?}"))
