@@ -37,8 +37,11 @@ In the resume path, when the backend has been suspended via
 `save_backend_state`, replay the per-queue tail of `setup_vhost_user`:
 `SET_VRING_NUM`, `SET_VRING_ADDR`, `SET_VRING_BASE` (with the indices captured
 at snapshot time), `SET_VRING_CALL`, `SET_VRING_KICK`, then
-`SET_VRING_ENABLE(1)` for all queues. No `SET_DEVICE_STATE_FD(LOAD)` round-trip
-is needed — the backend retains its filesystem-level state across SAVE.
+`SET_VRING_ENABLE(1)` for all queues. After the vrings are enabled, write the
+retained kick eventfds once so descriptors that were already available at
+resume time are processed by a fully re-armed backend. No
+`SET_DEVICE_STATE_FD(LOAD)` round-trip is needed — the backend retains its
+filesystem-level state across SAVE.
 
 To make this possible, two pieces of state are retained on `VhostUserHandle`,
 captured at the points where they are naturally produced:
@@ -56,9 +59,10 @@ captured at the points where they are naturally produced:
 
 A new `restart_vrings(&mut self, virtio_interrupt: &dyn VirtioInterrupt)`
 method on `VhostUserHandle` replays the wire sequence using the saved bases,
-`self.kick_evts`, `self.vrings_info`, and `self.queue_indexes`. It leaves the
-retained restart state untouched on error so resume can be retried, and clears
-the saved bases only after the restart succeeds.
+`self.kick_evts`, `self.vrings_info`, and `self.queue_indexes`, then kicks the
+retained eventfds after enabling the vrings. It leaves the retained restart
+state untouched on error so resume can be retried, and clears the saved bases
+only after the restart and post-enable kicks succeed.
 The four-call per-queue body is duplicated once with `setup_vhost_user`'s
 inlined version (~8 LoC) — the alternative (extracting a shared helper)
 increases the activate hot path edit surface without proportional benefit.
@@ -75,8 +79,8 @@ without plumbing changes.
   captured at least one active queue; leaves it `None` for pre-activation
   snapshots with no vrings to restart.
 - `restart_vrings`: clones/borrows retained restart state while replaying the
-  setup sequence; clears `saved_vring_bases` and sets `ready = true` only after
-  success.
+  setup sequence; kicks the retained eventfds after enabling the vrings; clears
+  `saved_vring_bases` and sets `ready = true` only after success.
 - `pause_vhost_user` / `resume_vhost_user`: untouched (plain pause/resume path
   is unaffected).
 
@@ -99,7 +103,8 @@ The fix is built on one assumption about vhost-user back-end behavior:
 > internal state (i.e. is non-destructive on SAVE) that the source can resume
 > processing by re-issuing the standard ring-arming sequence (`SET_VRING_NUM`
 > → `SET_VRING_ADDR` → `SET_VRING_BASE` → `SET_VRING_KICK` → `SET_VRING_CALL`
-> → `SET_VRING_ENABLE(1)`), without a corresponding `LOAD` operation.
+> → `SET_VRING_ENABLE(1)`), then kicking the re-armed rings, without a
+> corresponding `LOAD` operation.
 
 This assumption is necessary for the fix to work as designed. If a back-end
 genuinely destroys state on SAVE, the only correct path on resume would be
@@ -128,7 +133,7 @@ The same spec describes the start/stop mechanics:
 > upon receiving `VHOST_USER_GET_VRING_BASE`."*
 
 So the canonical way to bring a ring back from "stopped" is to re-establish
-the kick FD and let the next kick re-arm processing — exactly the sequence
+the kick FD and deliver a kick after the ring is enabled — exactly the sequence
 this fix replays.
 
 ### QEMU reference implementation
@@ -223,9 +228,10 @@ exactly what the new `restart_vrings` does.
   all four; issues `SET_VRING_NUM` for every queue first, then per-queue
   `SET_VRING_ADDR` / `SET_VRING_BASE` / `SET_VRING_CALL` (gated on
   `virtio_interrupt.notifier(...)`) / `SET_VRING_KICK`; calls existing
-  `enable_vhost_user_vrings(true)`; clears `saved_vring_bases` and sets
-  `ready = true` only after success. If any step fails, the retained bases and
-  kick FDs remain available for a retry.
+  `enable_vhost_user_vrings(true)`; writes each retained kick eventfd once
+  (reusing the existing `FailedSignalingUsedQueue` error variant); clears
+  `saved_vring_bases` and sets `ready = true` only after success. If any step
+  fails, the retained bases and kick FDs remain available for a retry.
 
 ### `virtio-devices/src/vhost_user/mod.rs`
 
@@ -252,6 +258,10 @@ exactly what the new `restart_vrings` does.
   commands are wrapped in `timeout 10` so a hang surfaces as
   `NonZeroExitStatus(124)` and a clean test failure rather than blocking
   indefinitely.
+- The test also starts a guest background writer before the pause/snapshot and
+  waits for it to complete after resume. This covers descriptors that were
+  already available at resume time, which would otherwise be missed by testing
+  only newly issued post-resume I/O.
 
 ### Untouched
 
@@ -275,14 +285,18 @@ exactly what the new `restart_vrings` does.
 - **Plain pause/resume (no snapshot):** unchanged. `pause_vhost_user` only
   sends `SET_VRING_ENABLE(0)`, `saved_vring_bases` stays `None`, and the
   existing `resume_vhost_user` branch runs.
+- **Pending work at resume time:** covered by the post-enable kick inside
+  `restart_vrings`. This avoids changing the outer resume ordering for all
+  vhost-user devices while still ensuring that any descriptor made available
+  before the snapshot is observed after the backend rings are re-armed.
 - **Pre-activation pause/snapshot/resume:** unchanged. `save_backend_state`
   still returns `vring_bases = Some(vec![])` in the snapshot state for
   consistency with `backend_state`, but the live handle keeps
   `saved_vring_bases = None`, so resume does not require an `interrupt_cb`.
-- **Resume retry after backend restart error:** improved. `restart_vrings`
-  leaves `saved_vring_bases` and `kick_evts` intact on error, so a later
-  `resume` attempt can retry the full ring-arming sequence instead of falling
-  through to the `ready=false` no-op path.
+- **Resume retry after backend restart or kick error:** improved.
+  `restart_vrings` leaves `saved_vring_bases` and `kick_evts` intact on error,
+  so a later `resume` attempt can retry the full ring-arming sequence instead
+  of falling through to the `ready=false` no-op path.
 - **Source-side resume after a *failed* live migration:** today silently
   broken (the same `ready=false` no-op); with this fix, works correctly per
   spec. Net positive.
@@ -301,6 +315,7 @@ exactly what the new `restart_vrings` does.
   nightly-only import options).
 - `git diff --check`: clean.
 - `cargo check -p virtio-devices`: clean.
+- `cargo check -p cloud-hypervisor --test integration`: clean.
 - `cargo test -p virtio-devices vhost_user`: clean; the filter matches no
   unit tests, but the test binary compiles.
 - The new integration test was **not** executed locally — it requires the

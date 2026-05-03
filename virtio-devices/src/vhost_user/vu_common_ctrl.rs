@@ -632,6 +632,12 @@ impl VhostUserHandle {
 
         self.enable_vhost_user_vrings(queue_indexes, true)?;
 
+        // Kick after enabling so any descriptors already available at resume time
+        // are processed by a backend that is fully re-armed.
+        for kick_evt in &self.kick_evts {
+            kick_evt.write(1).map_err(Error::FailedSignalingUsedQueue)?;
+        }
+
         self.saved_vring_bases = None;
         self.ready = true;
 

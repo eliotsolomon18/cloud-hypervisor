@@ -8908,6 +8908,27 @@ mod common_sequential {
                 .ssh_command("sudo bash -c 'echo pre_snapshot_data > mount_dir/pre_snapshot_file'")
                 .unwrap();
 
+            // Keep virtio-fs I/O active across the pause/snapshot boundary so
+            // resume must also wake descriptors that were already available.
+            guest
+                .ssh_command(
+                    "rm -f /tmp/pending_resume_started /tmp/pending_resume_done \
+                     /tmp/pending_resume.log && \
+                     nohup sudo bash -c 'set -e; \
+                     echo started > /tmp/pending_resume_started; \
+                     rm -f mount_dir/pending_resume_file; \
+                     for i in $(seq 1 8192); do \
+                     printf \"pending_resume_%05d\\n\" \"$i\" >> mount_dir/pending_resume_file; \
+                     if [ $((i % 64)) -eq 0 ]; then sync -f mount_dir/pending_resume_file 2>/dev/null || sync; fi; \
+                     done; \
+                     echo done > /tmp/pending_resume_done' \
+                     >/tmp/pending_resume.log 2>&1 &",
+                )
+                .unwrap();
+            assert!(wait_until(Duration::from_secs(30), || guest
+                .ssh_command("test -f /tmp/pending_resume_started")
+                .is_ok()));
+
             // Pause + snapshot on the same VMM (no kill, no fresh VMM after).
             snapshot_restore_common::snapshot_and_check_events(
                 &api_socket,
@@ -8952,6 +8973,16 @@ mod common_sequential {
                 "foo"
             );
 
+            assert!(wait_until(Duration::from_secs(60), || guest
+                .ssh_command("test -f /tmp/pending_resume_done")
+                .is_ok()));
+            let pending_resume_content =
+                std::fs::read_to_string(shared_dir.join("pending_resume_file")).unwrap();
+            assert_eq!(
+                pending_resume_content.lines().last(),
+                Some("pending_resume_08192")
+            );
+
             // Write a new file after the resume; verify it appears on the host.
             guest
                 .ssh_command(
@@ -8971,6 +9002,7 @@ mod common_sequential {
         let _ = daemon_child.wait();
         let _ = remove_dir_all(snapshot_dir.as_str());
         let _ = std::fs::remove_file(shared_dir.join("pre_snapshot_file"));
+        let _ = std::fs::remove_file(shared_dir.join("pending_resume_file"));
         let _ = std::fs::remove_file(shared_dir.join("post_resume_file"));
     }
 
