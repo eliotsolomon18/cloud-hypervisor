@@ -602,8 +602,7 @@ impl VhostUserHandle {
             ));
         }
 
-        // Send SET_VRING_NUM for every queue first (matches setup_vhost_user's early-num
-        // pattern; some backends require this before per-queue addr/base/kick/call).
+        // SET_VRING_NUM in its own loop first; see setup_vhost_user for rationale.
         for (i, queue_index) in queue_indexes.iter().enumerate() {
             self.vu
                 .set_vring_num(*queue_index, vrings_info[i].config_data.queue_size)
